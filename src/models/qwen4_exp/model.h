@@ -62,6 +62,8 @@ public:
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
+    // The dense weights' device arena, for the spill guard's confirming read.
+    [[nodiscard]] DeviceSpan device_range() const noexcept { return backing_.device_range(); }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
     // window borrows device memory from the expert cache, design §19.3.2).
     [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {

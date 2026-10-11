@@ -604,9 +604,17 @@ public:
         return bytes;
     }
 
-    static void allocate(DeviceBuffer& buffer, std::size_t bytes, std::uint64_t& tally) {
+    // The fixed allocations' ranges, for the spill guard's confirming read (cleared once checked).
+    std::vector<DeviceSpan> fixed_spans_;
+    void allocate(DeviceBuffer& buffer, std::size_t bytes, std::uint64_t& tally) {
         buffer = DeviceBuffer(bytes);
         tally += bytes;
+        if (bytes != 0) { fixed_spans_.push_back(DeviceSpan{buffer.p, buffer.bytes}); }
+    }
+    static std::string gbps(double bytes_per_second) {
+        char text[32];
+        std::snprintf(text, sizeof(text), "%.0f GB/s", bytes_per_second / 1e9);
+        return text;
     }
 
     // The startup failure for device allocations the driver placed in system memory.
@@ -743,6 +751,7 @@ public:
         wide_work_     = plan_.wide_work;
         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
         allocated += work_capacity_;
+        fixed_spans_.push_back(DeviceSpan{work_->base(), work_->capacity()});
 
         // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
         // faults on a registered block's host address where the device maps it elsewhere: WDDM).
@@ -766,8 +775,19 @@ public:
         if (allocated != plan_.bytes.fixed_bytes()) {
             throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
         }
-        if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
-            throw std::runtime_error(spill_message(spilled));
+        {
+            // A shortfall in free memory is confirmed by reading the listed buffers slice by slice;
+            // the KV pool's chunks and the residency's tables are not listed and count as resident.
+            const SpillGuard::Check check = guard.end(allocated, fixed_spans_, device_.stream);
+            fixed_spans_.clear();
+            fixed_spans_.shrink_to_fit();
+            if (check.spilled != 0) { throw std::runtime_error(spill_message(check.spilled)); }
+            if (check.suspected != 0) {
+                diagnostic("free VRAM fell " + std::to_string(check.suspected >> 20) + " MiB short of the Program's " +
+                               std::to_string(allocated >> 20) + " MiB of fixed allocations, which read at " +
+                               gbps(check.slowest_bytes_per_second) + " (device memory); kept",
+                           DiagnosticLevel::Debug);
+            }
         }
         CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.stream, cudaStreamNonBlocking));
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
@@ -890,6 +910,12 @@ public:
             demand.max_frames  = residency_->frame_limit();
             sizing_            = size_expert_frames(vram_->query(), demand);
             const auto grown   = residency_->resize(sizing_.frames, device_.stream, *vram_);
+            if (grown.suspected != 0) {
+                diagnostic("free VRAM did not reflect " + std::to_string(grown.suspected >> 20) +
+                               " MiB of expert frames, which read at " + gbps(grown.read_bytes_per_second) +
+                               " (device memory); kept",
+                           DiagnosticLevel::Debug);
+            }
             if (grown.spilled != 0) {
                 diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory "
                        "and given back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
@@ -2384,7 +2410,9 @@ public:
         diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") +
                    std::to_string(after.device_free >> 20) + " MiB: expert cache " + std::to_string(before) +
                    " -> " + std::to_string(frames_now_) + " frames" +
-                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""), DiagnosticLevel::Info);
+                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : "") +
+                   (resized.suspected != 0 ? " (free VRAM did not reflect a chunk that reads at device speed; kept)" : ""),
+               DiagnosticLevel::Info);
         if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
             diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
                        std::to_string(startup_frames_) +

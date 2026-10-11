@@ -128,6 +128,10 @@ public:
     // host address, so the runtime can copy the weights to device staging. Device code reads a
     // pinned object at its parent's WeightParent::device instead.
     [[nodiscard]] std::span<const std::byte> pinned_bytes_range() const;
+    // The device arena holding the Device objects, whole (empty without one).
+    [[nodiscard]] DeviceSpan device_range() const noexcept {
+        return arena_ ? DeviceSpan{arena_->base(), arena_->capacity()} : DeviceSpan{};
+    }
 
     // VMM arena pool present only when the plan reserved an evictable tail.
     [[nodiscard]] EvictableWeightPool* eviction_pool() noexcept {

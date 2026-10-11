@@ -1,7 +1,8 @@
 // VRAM facts for the memory track (design §19.3.7, measurements RM0a and the read half of RM0c;
 // memory-tiers.md §3). Run alone on an otherwise idle GPU:
 //
-//   infernix_vram_probe [--parity-gib N] [--chunks N] [--only malloc,vmm,query,unmap,parity]
+//   infernix_vram_probe [--parity-gib N] [--chunks N] [--pinned-gib N] [--reserve-gib N]
+//                       [--only malloc,vmm,query,unmap,parity,pinned,reserve,engine]
 //
 // It prints, for the CUDA device 0:
 //   1. a snapshot of every VRAM source: cudaMemGetInfo; on Windows DXGI LOCAL/NON_LOCAL budget and
@@ -20,6 +21,13 @@
 //   6. read parity: a streaming read and a gather of random 2,764,800-byte records over N GiB of
 //      cudaMalloc memory against the same over N GiB of 64 MiB VMM chunks (an Op-level proxy for
 //      RM0c; RM0c itself is a tg512 A/B with the R2 toggle).
+//   7. (--only pinned, reserve, engine) what pinning host memory, reserving a card-sized VMM
+//      address range, and the engine's startup order of allocations do to each source: where free
+//      memory and the OS usage part ways on a machine whose spill guard misfires. `--only engine`
+//      with the default 64 GiB pinned reproduces the divergence seen on Windows WDDM with two
+//      CUDA-visible GPUs: cudaMemGetInfo parts ways with DXGI LOCAL budget minus usage at the
+//      pinning step and ignores the frame chunk; with CUDA_VISIBLE_DEVICES limited to one GPU the
+//      two agree, and 32 GiB pinned does not trigger it.
 //
 // Nothing here changes driver or system settings.
 
@@ -756,11 +764,117 @@ void section_parity(const Probe& probe, std::size_t gib) {
     check(cudaStreamDestroy(stream), "stream destroy");
 }
 
+// A pageable block pinned as the loader pins the expert banks (cudaHostRegister, Portable | Mapped):
+// does pinning change what the device sources report, and does a device allocation made while the
+// block is pinned still lower free memory by its size once?
+void section_pinned(const Probe& probe, std::size_t gib) {
+    std::printf("\n== pinned host memory: cudaHostRegister of %zu GiB (Portable | Mapped), then 1 GiB cudaMalloc\n", gib);
+    const std::size_t bytes = gib << 30;
+    const Snapshot a        = probe.snapshot();
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    void* block = std::malloc(bytes);
+#endif
+    if (block == nullptr) { throw std::runtime_error("cannot commit the pageable block"); }
+    std::memset(block, 0, bytes);
+    const Snapshot b = probe.snapshot();
+    print_delta("after committing the pageable block", a, b, 0);
+    const auto t = Clock::now();
+    check(cudaHostRegister(block, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped), "cudaHostRegister");
+    const double seconds = us_since(t) / 1e6;
+    std::printf("  cudaHostRegister took %.2f s (%.1f GiB/s)\n", seconds, static_cast<double>(gib) / seconds);
+    const Snapshot c = probe.snapshot();
+    print_delta("after cudaHostRegister", b, c, 0);
+    void* p               = nullptr;
+    const std::size_t dev = std::size_t{1} << 30;
+    check(cudaMalloc(&p, dev), "cudaMalloc");
+    check(cudaMemset(p, 1, dev), "cudaMemset");
+    check(cudaDeviceSynchronize(), "sync");
+    const Snapshot d = probe.snapshot();
+    print_delta("after cudaMalloc 1 GiB while pinned", c, d, static_cast<long long>(dev));
+    check(cudaFree(p), "cudaFree");
+    check(cudaHostUnregister(block), "cudaHostUnregister");
+    const Snapshot e = probe.snapshot();
+    print_delta("after cudaFree + cudaHostUnregister", d, e, -static_cast<long long>(dev));
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    std::free(block);
+#endif
+}
+
+// A virtual address reservation the size of the card (the expert arena reserves one) with nothing
+// mapped, then one chunk mapped in it.
+void section_reserve(const Probe& probe, std::size_t gib) {
+    std::printf("\n== VMM address reservation: cuMemAddressReserve of %zu GiB (nothing mapped), then one 64 MiB chunk\n", gib);
+    const Snapshot a = probe.snapshot();
+    VmmChunks vmm((gib << 30) / kChunk, probe.device);
+    const Snapshot b = probe.snapshot();
+    print_delta("after cuMemAddressReserve", a, b, 0);
+    vmm.map_top();
+    check(cudaMemset(reinterpret_cast<void*>(vmm.base), 0, kChunk), "cudaMemset");
+    check(cudaDeviceSynchronize(), "sync");
+    const Snapshot c = probe.snapshot();
+    print_delta("after mapping one 64 MiB chunk in it", b, c, static_cast<long long>(kChunk));
+}
+
+// The engine's startup order (design section 19.3.7): a dense arena (cudaMalloc + fill), VMM
+// reservations for the KV pool and the expert frames with the KV's first chunks mapped, the pinned
+// expert banks, then the first frame chunk. Each step's deltas say where free memory and the OS
+// usage part ways. This reproduces the two-visible-GPU divergence (design section 19.3.7): with
+// both GPUs visible and 64 GiB pinned, CUDA free drops at the pinning step while the OS usage
+// stays put, and the frame chunk raises the OS usage while CUDA free does not move; with
+// CUDA_VISIBLE_DEVICES limited to one GPU the two agree, and 32 GiB pinned does not trigger it.
+void section_engine(const Probe& probe, std::size_t pinned_gib) {
+    std::printf("\n== engine order: 6 GiB cudaMalloc, KV and frame reservations (9 chunks mapped), %zu GiB pinned, one frame chunk\n",
+                pinned_gib);
+    const Snapshot a              = probe.snapshot();
+    void* dense                   = nullptr;
+    const std::size_t dense_bytes = std::size_t{6} << 30;
+    check(cudaMalloc(&dense, dense_bytes), "cudaMalloc dense");
+    check(cudaMemset(dense, 1, dense_bytes), "cudaMemset");
+    check(cudaDeviceSynchronize(), "sync");
+    const Snapshot b = probe.snapshot();
+    print_delta("after the 6 GiB dense arena", a, b, static_cast<long long>(dense_bytes));
+    VmmChunks kv((std::size_t{7} << 30) / kChunk, probe.device);
+    for (int i = 0; i < 9; ++i) { kv.map_top(); }
+    check(cudaMemset(reinterpret_cast<void*>(kv.base), 0, 9 * kChunk), "cudaMemset kv");
+    check(cudaDeviceSynchronize(), "sync");
+    VmmChunks frames(static_cast<std::size_t>(probe.prop.totalGlobalMem) / kChunk, probe.device);
+    const Snapshot c = probe.snapshot();
+    print_delta("after KV (7 GiB reserved, 9 chunks mapped) and frame (card-sized) reservations", b, c,
+                static_cast<long long>(9 * kChunk));
+    const std::size_t bytes = pinned_gib << 30;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    void* block = std::malloc(bytes);
+#endif
+    if (block == nullptr) { throw std::runtime_error("cannot commit the pageable block"); }
+    std::memset(block, 0, bytes);
+    check(cudaHostRegister(block, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped), "cudaHostRegister");
+    const Snapshot d = probe.snapshot();
+    print_delta("after pinning the banks", c, d, 0);
+    frames.map_top();
+    check(cudaMemset(reinterpret_cast<void*>(frames.base), 0, kChunk), "cudaMemset frame");
+    check(cudaDeviceSynchronize(), "sync");
+    const Snapshot e = probe.snapshot();
+    print_delta("after the first 64 MiB frame chunk", d, e, static_cast<long long>(kChunk));
+    check(cudaHostUnregister(block), "cudaHostUnregister");
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    std::free(block);
+#endif
+    check(cudaFree(dense), "cudaFree dense");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        std::size_t parity_gib = 8, chunks = 16;
+        std::size_t parity_gib = 8, chunks = 16, pinned_gib = 64, reserve_gib = 32;
         std::string only;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -768,12 +882,16 @@ int main(int argc, char** argv) {
                 parity_gib = std::stoul(argv[++i]);
             } else if (arg == "--chunks" && i + 1 < argc) {
                 chunks = std::stoul(argv[++i]);
+            } else if (arg == "--pinned-gib" && i + 1 < argc) {
+                pinned_gib = std::stoul(argv[++i]);
+            } else if (arg == "--reserve-gib" && i + 1 < argc) {
+                reserve_gib = std::stoul(argv[++i]);
             } else if (arg == "--only" && i + 1 < argc) {
                 only = "," + std::string(argv[++i]) + ",";
             } else {
                 std::fprintf(stderr,
-                             "usage: infernix_vram_probe [--parity-gib N] [--chunks N] "
-                             "[--only malloc,vmm,query,unmap,parity]\n");
+                             "usage: infernix_vram_probe [--parity-gib N] [--chunks N] [--pinned-gib N] [--reserve-gib N] "
+                             "[--only malloc,vmm,query,unmap,parity,pinned,reserve,engine]\n");
                 return 2;
             }
         }
@@ -798,6 +916,9 @@ int main(int argc, char** argv) {
         if (wanted("query")) { section_query_cost(probe); }
         if (wanted("unmap")) { section_unmap_stall(probe); }
         if (wanted("parity")) { section_parity(probe, parity_gib); }
+        if (wanted("pinned")) { section_pinned(probe, pinned_gib); }
+        if (wanted("reserve")) { section_reserve(probe, reserve_gib); }
+        if (wanted("engine")) { section_engine(probe, pinned_gib); }
 #ifdef _WIN32
         if (probe.dxgi.event != nullptr) {
             std::printf("\nDXGI budget-change event signalled during the run: %s\n",

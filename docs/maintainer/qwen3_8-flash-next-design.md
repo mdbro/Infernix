@@ -6771,7 +6771,9 @@ measured results are under "Status" at the end of this section.
 
 - **Core primitive** `src/core/vram_budget.{h,cpp}`: a `VramSnapshot` (device free and total,
   DXGI LOCAL budget and usage, display state, output count, D3DKMT `Demoted`) from a
-  `VramBudgetSource` per device context. Windows: `IDXGIFactory4::EnumAdapterByLuid`,
+  `VramBudgetSource` per device context. Since 2026-10-10 `device_free` is the OS budget less this
+  process's usage whenever a budget is known, and `cuda_free` keeps `cudaMemGetInfo`'s figure for
+  the ledger (below, spill guard). Windows: `IDXGIFactory4::EnumAdapterByLuid`,
   `QueryVideoMemoryInfo`, `EnumOutputs`, the budget-change event and an `IsCurrent()` refresh for
   hot-plug; NVML through `LoadLibrary`/`dlopen` only, so a missing DLL never stops startup. A
   process-wide test seam supplies fake budgets (RT7, RT9, RT13).
@@ -6792,6 +6794,43 @@ measured results are under "Status" at the end of this section.
   optional "Prefer No Sysmem Fallback" advice; during a grow it unmaps the chunk and stops growing.
   Every startup pinned host allocation (embedding, tier slots, n-gram cache, prefix Host tier,
   vision tower) happens before the final frame sizing (WDDM late pinning, Strata #620).
+  - **Confirmed by a read (2026-10-10).** The shortfall is a suspicion. `SpillGuard::end(bytes,
+    memory, stream)` then reads the step's memory in 64 MiB slices with cache-volatile loads
+    (`core/residency_probe.{h,cu}`, the best of three passes per slice, so a GPU time slice lent to
+    another process does not slow a resident slice) and counts only slices below 128 GB/s as
+    spilled: system memory over PCIe 5.0 x16 reads under 64 GB/s, the slowest sm_120 card above
+    320 GB/s; slices under 8 MiB are launch-bound and count as resident. Reason (established
+    2026-10-11): on Windows WDDM with more than one CUDA-visible GPU, once the process has pinned at
+    least 64 GiB of host memory (`cudaHostRegister`, Portable | Mapped, as the loader pins the
+    expert banks) and holds an empty card-sized address reservation (`cuMemAddressReserve`, the
+    expert arena), `cudaMemGetInfo` and `cuMemGetInfo` fall below the DXGI LOCAL budget less usage
+    and then stop moving when physical chunks are mapped, while DXGI usage keeps tracking every
+    allocation; releasing the empty reservation restores agreement. Machine: 9950X3D, RTX 5090 at
+    PCI 01:00 (no display), RTX 3090 at PCI 0c:00 (desktop), driver 617.42, Windows 11 26200,
+    CUDA 13.4.92, HAGS off, 253 GB RAM. An engine trace (CUDA free / budget less usage, MiB): after
+    materialization 24,566 / 24,566; after the KV mapping 23,762 / 23,762; before the frame
+    reservation 22,874 / 22,874; after the empty 34,225,520,640-byte frame reservation
+    20,555.8 / 22,874; after prefix-cache creation 16,413.9 / 22,866; after the first 64 MiB frame
+    chunk 16,413.9 / 22,802, 6,452 MiB apart. Every chunk looked spilled: the cache started with 0
+    of 6,030 frames (four starts) and decoded at 35 tok/s, while `--vram-past-budget`, which
+    derived free memory from the budget, sized 8,720 frames at the README's speed.
+    `infernix_vram_probe --only engine` (section 7 of the probe, 64 GiB pinned by default)
+    reproduces it: with both GPUs visible, pinning the banks lowered CUDA free by 1,623 MiB while
+    LOCAL usage did not move, and the frame chunk raised LOCAL usage by 64 MiB while CUDA free did
+    not move. Controls: with only the RTX 5090 visible (`CUDA_VISIBLE_DEVICES` set to its UUID)
+    pinning changes neither figure, the chunk lowers CUDA free and raises LOCAL usage by 64 MiB
+    each, and the engine with the previous guard sizes 8,477 frames; with 32 GiB pinned and both
+    GPUs visible there is no divergence, which is why the first probe run (32 GiB) missed it. A
+    standalone CUDA + DXGI reproducer without Infernix code gives the same three results. The fix
+    does not depend on this trigger: sizing no longer decides on CUDA's figure, the OS budget less
+    usage was correct in every measurement, and the read measures placement directly; where the
+    two figures agree (one visible GPU) behaviour is unchanged. A build without the fix is worked
+    around by setting `CUDA_VISIBLE_DEVICES` to the compute GPU's UUID for the server process; the
+    other GPU stays usable by Windows. Not established: the driver's rule behind the lower figure
+    (the behaviour is described, not a mechanism), and the CUDA-visible device list of the RM0a
+    measurement, whose agreement the single-GPU control reproduces. `test_residency_probe.cpp`
+    checks the read against mapped host memory (the path a spilled allocation takes) and device
+    memory.
 - **Flags.** `--vram-headroom-mib N|auto` (existing name; `auto` is new and the default) for
   Qwen4Exp: 512 MiB with a display and the elastic pool, 1,024 MiB with a display in warning-only
   mode, 256 MiB headless. Qwen3.5 keeps its meaning (`auto` = 1 GiB); the field moves from
@@ -7115,7 +7154,8 @@ change at merge time.
 
 - **RM0a.** DXGI LOCAL `CurrentUsage` counts CUDA allocations (1,024 of 1,024 MiB), and
   `cudaMemGetInfo` free equals the OS budget minus that usage (budget 31,419 of 32,579 MiB with no
-  display): free memory and the budget bound coincide on this card. VMM: create 77 / map 1 /
+  display): free memory and the budget bound coincide on this card (with a single CUDA-visible GPU;
+  with a second CUDA-visible GPU and >= 64 GiB pinned they part ways, Feature 1, spill guard). VMM: create 77 / map 1 /
   access 4 / unmap 60 / release 162 us (p50, idle); from another thread during launches unmap
   0.9 ms and release 0.27 ms p50 (p99 7.6 / 9.8 ms) and the launch loop slows 9 %, so resizes
   unmap on the engine thread at a boundary; unmap does not wait for running kernels; released

@@ -44,6 +44,13 @@ infernix_add_test(infernix_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 infernix_add_test(infernix_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES infernix_core)
 
+# The spill guard's confirming read: device memory above the floor, mapped host memory below it,
+# a scripted shortfall confirmed or cleared from the read alone (skips without a GPU).
+infernix_add_test(infernix_residency_probe_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_residency_probe.cpp"
+  LIBRARIES infernix_core)
+set_tests_properties(infernix_residency_probe_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
 infernix_add_test(infernix_kv_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
   LIBRARIES infernix_core)

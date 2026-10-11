@@ -1,5 +1,7 @@
 #include "core/vram_budget.h"
 
+#include "core/residency_probe.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -160,6 +162,7 @@ public:
         }
         out.device_free  = free_bytes;
         out.device_total = total_bytes;
+        out.cuda_free    = free_bytes;
 #ifdef _WIN32
         // An adapter's output list is a snapshot of its factory: recreate both after a hot-plug.
         if (factory_ != nullptr && !factory_->IsCurrent()) {
@@ -169,16 +172,15 @@ public:
         if (adapter_ != nullptr) {
             DXGI_QUERY_VIDEO_MEMORY_INFO info{};
             if (SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
-                out.has_budget   = true;
-                out.local_budget = info.Budget;
-                out.local_usage  = info.CurrentUsage;
-                if (allowance_ != 0) { // free memory as cudaMemGetInfo derives it, from the wider budget
-                    out.budget_allowance = allowance_;
-                    out.local_budget += allowance_;
-                    out.device_free = out.local_budget > out.local_usage
-                                          ? static_cast<std::size_t>(out.local_budget - out.local_usage)
-                                          : 0;
-                }
+                out.has_budget       = true;
+                out.local_budget     = info.Budget + allowance_;
+                out.local_usage      = info.CurrentUsage;
+                out.budget_allowance = allowance_;
+                // Free memory from the OS figures (VramSnapshot::device_free), not from cudaMemGetInfo,
+                // while a budget is known.
+                out.device_free = out.local_budget > out.local_usage
+                                      ? static_cast<std::size_t>(out.local_budget - out.local_usage)
+                                      : 0;
             }
             out.outputs = outputs_;
         }
@@ -271,6 +273,16 @@ std::uint64_t spill_shortfall(std::uint64_t free_before, std::uint64_t free_afte
 std::uint64_t SpillGuard::end(std::uint64_t bytes) {
     if (spill_shortfall(before_, source_.query().device_free, bytes) == 0) { return 0; }
     return spill_shortfall(before_, source_.query().device_free, bytes);
+}
+
+SpillGuard::Check SpillGuard::end(std::uint64_t bytes, std::span<const DeviceSpan> memory, cudaStream_t stream) {
+    Check out;
+    out.suspected = end(bytes);
+    if (out.suspected == 0) { return out; }
+    const ResidencyReading read  = measure_residency(memory, stream);
+    out.slowest_bytes_per_second = read.slowest_bytes_per_second;
+    out.spilled                  = read.slow_bytes;
+    return out;
 }
 
 std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget) {

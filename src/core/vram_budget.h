@@ -1,13 +1,18 @@
 #pragma once
 
-// Physical facts about one CUDA device's video memory: device-wide free memory, this process's OS
-// budget (Windows WDDM, through DXGI) and whether the device drives a display. No policy: sizing
+// Physical facts about one CUDA device's video memory: free memory for this process, its OS budget
+// (Windows WDDM, through DXGI) and whether the device drives a display. No policy: sizing
 // decisions live with their owners (docs/maintainer/qwen3_8-flash-next-design.md §19.3.7).
+
+#include "core/arena.h"
+
+#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 
 namespace infernix {
 
@@ -18,9 +23,15 @@ enum class DisplayState : std::uint8_t {
 };
 
 struct VramSnapshot {
-    std::size_t device_free  = 0; // cudaMemGetInfo (device-wide under WDDM)
+    // Free device memory for this process. Under WDDM with a budget source, the OS budget less this
+    // process's local usage (DXGI QueryVideoMemoryInfo); otherwise cudaMemGetInfo. The two agree in
+    // a fresh process, but inside the engine cudaMemGetInfo has been seen 6.4 GiB low (the dense
+    // weights counted twice) and unmoved by a mapped VMM chunk, which sized the expert cache a third
+    // too small and made every chunk look spilled; the OS figures tracked both correctly.
+    std::size_t device_free  = 0;
     std::size_t device_total = 0;
-    // Windows WDDM: this process's local-memory budget and usage (DXGI QueryVideoMemoryInfo).
+    std::size_t cuda_free    = 0; // cudaMemGetInfo's own figure, for the ledger
+    // Windows WDDM: this process's local-memory budget and usage.
     bool has_budget            = false;
     std::uint64_t local_budget = 0;
     std::uint64_t local_usage  = 0;
@@ -48,10 +59,10 @@ public:
 // VRAM that is allocatable at device speed (RTX 5090: budget 31,419 MiB against 32,187 MiB of
 // physical memory less the driver's reserve; 640 MiB more allocated, design §19.3.8 VRAM item 2).
 // The source then measures once, at open, allowance = NVML physical (total - reserved) - the
-// budget - kPastBudgetMargin, and reports budget + allowance as the budget and free memory derived
-// from it, as cudaMemGetInfo derives it (budget - usage). A later budget cut by the OS lowers the
-// effective budget by the same amount. Memory past the budget may be demoted to system memory
-// when another program needs VRAM. Without DXGI or NVML the allowance is 0.
+// budget - kPastBudgetMargin, and reports budget + allowance as the budget, from which free memory
+// is derived as always (budget - usage). A later budget cut by the OS lowers the effective budget by
+// the same amount. Memory past the budget may be demoted to system memory when another program
+// needs VRAM. Without DXGI or NVML the allowance is 0.
 inline constexpr std::uint64_t kPastBudgetMargin = 128ULL << 20;
 [[nodiscard]] std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget = false);
 
@@ -63,15 +74,30 @@ inline constexpr std::uint64_t kSpillToleranceBytes = 32ULL << 20;
                                             std::uint64_t bytes,
                                             std::uint64_t tolerance = kSpillToleranceBytes) noexcept;
 
-// Checks device allocation steps against a source's free memory. A shortfall is confirmed by a
-// second reading, since another program can change free memory during the step.
+// Checks device allocation steps against a source's free memory, and confirms what that bookkeeping
+// suspects by reading the memory: a shortfall in free memory can come from the OS budget moving
+// with the allocation, or from a free-memory figure that does not reflect it, as well as from a
+// real placement in system memory, and only the read tells them apart (core/residency_probe.h).
 class SpillGuard {
 public:
     explicit SpillGuard(VramBudgetSource& source) : source_(source) {}
     // Records free memory before a step.
     void begin() { before_ = source_.query().device_free; }
-    // After a step that allocated `bytes`: the bytes not placed in device memory (0: resident).
+    // After a step that allocated `bytes`: the bytes missing from the drop in free memory (0: all
+    // of it accounted for). Bookkeeping only; a shortfall is confirmed by a second reading, since
+    // another program can change free memory during the step.
     [[nodiscard]] std::uint64_t end(std::uint64_t bytes);
+
+    struct Check {
+        std::uint64_t suspected = 0; // bytes missing from the drop in free memory
+        std::uint64_t spilled   = 0; // of the step's memory, bytes a timed read found in system memory
+        double slowest_bytes_per_second = 0.0; // the confirming read's slowest slice; 0 when none ran
+    };
+    // After a step that allocated `bytes` into `memory` (device-accessible; the step's work on
+    // `stream` is waited for): the bookkeeping's suspicion, and the spill it confirms. The read runs
+    // only on a suspicion, in slices (kResidencySliceBytes); slices below kResidencyMinimumBytes
+    // count as resident. A suspicion the read clears is the bookkeeping's error, not a spill.
+    [[nodiscard]] Check end(std::uint64_t bytes, std::span<const DeviceSpan> memory, cudaStream_t stream);
 
 private:
     VramBudgetSource& source_;
