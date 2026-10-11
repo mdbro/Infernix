@@ -121,7 +121,13 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
                 guard.begin();
                 frame_memory_ = DeviceBuffer(static_cast<std::size_t>(frames) * stride_);
                 frame_memory_.fill(0);
-                const std::uint64_t spilled = guard.end(frame_memory_.bytes);
+                const DeviceSpan memory{frame_memory_.p, frame_memory_.bytes};
+                const SpillGuard::Check check = guard.end(frame_memory_.bytes, std::span(&memory, 1), compute);
+                if (check.suspected != 0) {
+                    out.suspected += check.suspected - std::min(check.suspected, check.spilled);
+                    out.read_bytes_per_second = check.slowest_bytes_per_second;
+                }
+                const std::uint64_t spilled = check.spilled;
                 if (spilled == 0) { break; }
                 out.spilled = spilled;
                 frame_memory_ = DeviceBuffer{};
@@ -172,9 +178,15 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
             CUDA_CHECK(cudaMemsetAsync(base + arena_->mapped_bytes() - arena_->chunk_bytes(), 0, arena_->chunk_bytes(),
                                        compute));
             CUDA_CHECK(cudaStreamSynchronize(compute));
-            if (const std::uint64_t spilled = guard.end(arena_->chunk_bytes()); spilled != 0) {
+            const DeviceSpan chunk{base + arena_->mapped_bytes() - arena_->chunk_bytes(), arena_->chunk_bytes()};
+            const SpillGuard::Check check = guard.end(arena_->chunk_bytes(), std::span(&chunk, 1), compute);
+            if (check.suspected != 0) {
+                out.suspected += check.suspected - std::min(check.suspected, check.spilled);
+                out.read_bytes_per_second = check.slowest_bytes_per_second;
+            }
+            if (check.spilled != 0) {
                 arena_->unmap_chunk();
-                out.spilled = spilled;
+                out.spilled = check.spilled;
                 break;
             }
         }

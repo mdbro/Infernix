@@ -96,15 +96,20 @@ public:
 
     struct Resize {
         std::uint32_t frames  = 0;     // frames backed afterwards
-        std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
+        std::uint64_t spilled = 0;     // bytes of a chunk a timed read found in system memory (given back)
         bool refused          = false; // the device had no memory for the next chunk
+        // Bytes free memory did not reflect although the read found them in device memory (kept:
+        // the bookkeeping's error, not a spill), and that read's slowest slice.
+        std::uint64_t suspected      = 0;
+        double read_bytes_per_second = 0.0;
     };
     // Backs `frames` frames (clamped to frame_limit()); unchanged while frames are lent. Call only
     // between rounds, with nothing in flight on the compute stream: promotion copies are waited for,
     // then a shrink evicts the
     // lowest-score experts, moves the survivors above the new top below it on `compute` and
     // releases the top chunks; a grow maps chunks one at a time, stops at the first the driver
-    // refuses or places in system memory (`vram` tells), and fills the new frames from the queue.
+    // refuses or places in system memory (`vram` suspects it from free memory, a timed read of the
+    // chunk confirms it: SpillGuard), and fills the new frames from the queue.
     // Without VMM only the first call allocates.
     Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram);
     // Frame lending (design §19.3.2, "Frame lending"): a contiguous run of frames serves another use

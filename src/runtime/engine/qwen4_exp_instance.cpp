@@ -1,6 +1,7 @@
 #include "runtime/engine/qwen4_exp_instance.h"
 
 #include "artifact/reader.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
@@ -104,6 +105,34 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
       capacity(options.max_context) {}
 
 Qwen4ExpInstance::~Qwen4ExpInstance() = default;
+
+namespace {
+
+std::string gbps(double bytes_per_second) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.0f GB/s", bytes_per_second / 1e9);
+    return text;
+}
+
+// cudaMemGetInfo's figure against the OS budget less this process's usage, when they part ways by
+// more than the spill tolerance: the OS figures size the cache (VramSnapshot::device_free); the
+// difference is what a machine whose spill guard misfired showed (design §19.3.7, spill guard).
+void report_cuda_divergence(const EngineOptions& options, const char* when, const VramSnapshot& s) {
+    if (!s.has_budget) { return; }
+    // --vram-past-budget adds an allowance cudaMemGetInfo never sees: the expected CUDA figure is
+    // the derived one less that allowance.
+    const std::uint64_t expected = s.device_free > s.budget_allowance ? s.device_free - s.budget_allowance : 0;
+    const std::uint64_t gap      = s.cuda_free > expected ? s.cuda_free - expected : expected - s.cuda_free;
+    if (gap <= kSpillToleranceBytes) { return; }
+    report(options, DiagnosticLevel::Debug,
+           std::string("VRAM ") + when + ": cudaMemGetInfo reports " + std::to_string(mib(s.cuda_free)) +
+               " MiB free; the OS budget less this process's usage is " + std::to_string(mib(s.device_free)) +
+               " (budget " + std::to_string(mib(s.local_budget)) + ", usage " + std::to_string(mib(s.local_usage)) +
+               (s.budget_allowance != 0 ? ", of which " + std::to_string(mib(s.budget_allowance)) + " past the OS budget" : std::string()) +
+               "), which the engine uses");
+}
+
+} // namespace
 
 ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device) {
     validate(options);
@@ -227,6 +256,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const std::uint64_t dense = plan.device_bytes();
     auto vram                 = open_vram_budget_source(device.device, options.vram_past_budget);
     const VramSnapshot before = vram->query();
+    report_cuda_divergence(options, "before loading", before);
     models::qwen4_exp::VramDemand vram_demand;
     vram_demand.headroom    = options.vram_headroom_bytes;
     vram_demand.graphs      = device_plan.graph_bound;
@@ -254,12 +284,26 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     guard.begin();
     auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
-    if (const std::uint64_t spilled = guard.end(dense); spilled != 0) {
-        throw std::runtime_error(std::to_string(mib(spilled)) +
-                                 " MiB of the dense weights were placed in shared system memory by the driver's "
-                                 "sysmem fallback: free VRAM and start again");
+    {
+        // A shortfall in free memory is confirmed by reading the arena back (the evictable tail, if
+        // any, is not read and counts as resident).
+        const DeviceSpan arena        = model->device_range();
+        const SpillGuard::Check check = guard.end(dense, std::span(&arena, 1), device.stream);
+        if (check.spilled != 0) {
+            throw std::runtime_error(std::to_string(mib(check.spilled)) +
+                                     " MiB of the dense weights were placed in shared system memory by the driver's "
+                                     "sysmem fallback: free VRAM and start again");
+        }
+        if (check.suspected != 0) {
+            report(options, DiagnosticLevel::Debug,
+                   "free VRAM fell " + std::to_string(mib(check.suspected)) + " MiB short of the dense weights' " +
+                       std::to_string(mib(dense)) + " MiB, which read at " + gbps(check.slowest_bytes_per_second) +
+                       " (device memory); kept");
+        }
     }
-    const std::uint64_t after_weights = vram->query().device_free;
+    const VramSnapshot after_weights_snapshot = vram->query();
+    const std::uint64_t after_weights         = after_weights_snapshot.device_free;
+    report_cuda_divergence(options, "after the dense weights", after_weights_snapshot);
 
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
@@ -271,7 +315,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto& sizing = instance->program->vram_sizing();
     const std::uint64_t frames_bytes =
         static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_record_stride;
-    const std::uint64_t after_startup = vram->query().device_free;
+    const VramSnapshot after_startup_snapshot = vram->query();
+    const std::uint64_t after_startup         = after_startup_snapshot.device_free;
+    report_cuda_divergence(options, "after startup", after_startup_snapshot);
     {
         const char* display = before.display == DisplayState::Headless   ? "no display"
                               : before.display == DisplayState::Attached ? "display attached"
@@ -280,14 +326,21 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         const std::string past = before.budget_allowance == 0
                                      ? std::string()
                                      : " (" + std::to_string(mib(before.budget_allowance)) + " MiB past the OS budget)";
-        char line[704];
+        // Under WDDM free memory is the OS budget less this process's usage (VramSnapshot).
+        const std::string budget =
+            after_startup_snapshot.has_budget
+                ? " (OS budget " + std::to_string(mib(after_startup_snapshot.local_budget)) + " MiB, this process uses " +
+                      std::to_string(mib(after_startup_snapshot.local_usage)) + ")"
+                : std::string();
+        char line[896];
         std::snprintf(line, sizeof(line),
                       "VRAM ledger: %llu MiB card, %s, %llu in use before loading%s; %s; reserve %llu (%u graphs); "
-                      "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup",
+                      "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup%s",
                       mib(before.device_total), display, mib(before.device_total - before.device_free), past.c_str(),
                       device_contributors(dense, device_plan).c_str(), mib(sizing.reserve), device_plan.graph_bound,
                       mib(sizing.headroom), options.vram_headroom_bytes ? "set" : "auto", sizing.frames,
-                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup));
+                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup),
+                      budget.c_str());
         report(options, DiagnosticLevel::Debug, line);
         const double gib = static_cast<double>(1ULL << 30);
         char summary[320];

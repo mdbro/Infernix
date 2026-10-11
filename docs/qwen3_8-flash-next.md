@@ -232,7 +232,13 @@ would fail too, so the server stops with that cause.
 ## VRAM
 
 At startup the engine reads the GPU's free memory, the Windows video-memory budget of the process
-and whether the GPU drives a display (DXGI outputs, then NVML). The expert cache takes
+and whether the GPU drives a display (DXGI outputs, then NVML). On Windows, free memory is that
+budget less what this process uses, both as the OS reports them; `cudaMemGetInfo` is the source
+without a budget (Linux), and when its figure parts ways with the OS's the debug log says so. On a
+machine with a second CUDA-visible GPU, once the 64.5 GiB of expert banks were pinned, CUDA's own
+figure ran 6.3 GiB low and did not move for the frame chunks, which started the cache with 0
+frames before this check used the OS figure; a build without it can be worked around by setting
+`CUDA_VISIBLE_DEVICES` to the compute GPU's UUID for the server process. The expert cache takes
 
 `min(free - fixed - headroom, budget - fixed - 64 MiB) - reserve`
 
@@ -253,10 +259,13 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   `--prefill-chunk`, `--kv-dtype int8`). Below 2,048 expert frames it warns that decode will be slow.
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
   system memory without an error, which slows everything down. The engine checks that every startup
-  allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
-  NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
-  Infernix executables makes such an allocation fail instead (optional).
+  allocation lowered free VRAM by its size and, when one did not, reads that memory back: a 64 MiB
+  slice that reads below 128 GB/s is in system memory (PCIe 5.0 x16 carries at most 64 GB/s; VRAM
+  reads above 1 TB/s), one that reads faster is in VRAM whatever the bookkeeping said. Dense
+  weights or fixed buffers confirmed spilled stop startup; expert frames confirmed spilled are given
+  back once and the cache starts smaller; a shortfall the read clears is kept and logged at debug
+  level. Setting the NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem
+  Fallback* for the Infernix executables makes such an allocation fail instead (optional).
 - **At runtime** the cache follows free VRAM. When another program (a browser, a game, the
   desktop) takes memory and free VRAM falls below half the headroom, the cache gives back the
   least valuable experts at the next round boundary, or at once when idle, and logs it; it grows

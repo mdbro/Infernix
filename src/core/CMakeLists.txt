@@ -10,6 +10,7 @@ add_library(infernix_core STATIC
   copy_batch.cpp
   evictable_weight_pool.cu
   vmm_arena.cu
+  residency_probe.cu
   device.cu
   direct_read_queue.cpp
   dtype.cpp
