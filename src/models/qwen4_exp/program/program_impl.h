@@ -939,6 +939,18 @@ public:
 
     const DeviceLayout& device_layout() const noexcept { return plan_; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
+    // The expert cache's counters since startup and its size now (the per-request figures in
+    // finish() are deltas of the same counters); nothing when the cache is off.
+    [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept {
+        if (!residency_) { return std::nullopt; }
+        const ExpertResidency::Stats& s = residency_->stats();
+        return ExpertCacheTotals{.frames     = residency_->frames(),
+                                 .routed     = s.routed,
+                                 .hits       = s.hits,
+                                 .promotions = s.promotions,
+                                 .landed     = s.landed,
+                                 .cpu_served = cpu_service_ ? cpu_service_->served_experts() : 0};
+    }
 
     // ---------------------------------------------------------------- admission
     RequestBasePlan plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {

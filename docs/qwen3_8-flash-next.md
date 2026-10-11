@@ -166,7 +166,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   as cold benchmarks need. Output is the same either way: where an expert is computed never
   changes a bit.
 - The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
-  the session and the last ten requests.
+  the session and the last ten requests. Each Chat Completions response's `timings` carries the
+  request's `expert_routed_n` and `expert_hit_n`, and `/metrics` exports the cache's frames and its
+  cumulative routed, hit, promotion, landing and CPU-served counts
+  ([serving](serving.md#live-metrics)).
 - After each request the engine logs two Debug lines (`--log-level debug`): the expert cache's
   hit rate, and the request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits,
   R NVMe reads, T ms of reads`, and with speculation `; G gated rounds: R NVMe reads (T ms) behind the gate, the GPU

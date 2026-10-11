@@ -209,6 +209,19 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "Main KV pool capacity in pages.");
     GAUGE(device_backend_kv_occupied_pages, "device_backend_kv_used_pages",
           "Occupied speculative backend KV pages.");
+    // The VRAM expert cache (Qwen3.8-Flash-Next): a gauge for its size, counters for its traffic.
+    if (stats.expert_cache) {
+        const ExpertCacheTotals& e = *stats.expert_cache;
+        const ExpertCacheTotals b  = baseline_.expert_cache.value_or(ExpertCacheTotals{});
+        gauge("expert_cache_frames", e.frames, "VRAM expert-cache frames backed now, one routed expert each.");
+        counter("expert_cache_routed_total", e.routed, b.routed, "Routed (layer, expert) uses.");
+        counter("expert_cache_hits_total", e.hits, b.hits, "Routed uses served from a VRAM frame.");
+        counter("expert_cache_promotions_total", e.promotions, b.promotions,
+                "Experts copied into frames by the cache policy.");
+        counter("expert_cache_landed_total", e.landed, b.landed, "Staged misses adopted into frames.");
+        counter("expert_cache_cpu_served_total", e.cpu_served, b.cpu_served,
+                "Misses computed by the CPU expert team.");
+    }
 #undef GAUGE
 #undef COUNTER
 

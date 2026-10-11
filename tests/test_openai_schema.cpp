@@ -879,6 +879,7 @@ GenerationOutcome sample_outcome() {
     outcome.metrics.generation_wall_seconds     = 0.03;
     outcome.metrics.speculative_draft_tokens    = 9;
     outcome.metrics.speculative_accepted_tokens = 6;
+    outcome.metrics.expert_cache                = infernix::ExpertCacheStats{.routed = 480, .hits = 432};
     return outcome;
 }
 
@@ -908,6 +909,15 @@ int test_aggregate_response() {
             response["timings"]["predicted_per_second"] == 200.0 &&
             response["timings"]["draft_n"] == 9 && response["timings"]["draft_n_accepted"] == 6,
         "aggregate timings use exact cache and N-1 generation intervals");
+    failures += check(response["timings"]["expert_routed_n"] == 480 && response["timings"]["expert_hit_n"] == 432,
+                      "aggregate timings carry the request's expert-cache lookups and hits");
+    {
+        GenerationOutcome dense = sample_outcome();
+        dense.metrics.expert_cache.reset();
+        const Json plain = Json::parse(make_chat_completion_response(identity(), dense));
+        failures += check(!plain["timings"].contains("expert_routed_n") && !plain["timings"].contains("expert_hit_n"),
+                          "timings omit the expert fields without an expert cache");
+    }
 
     outcome.text.clear();
     outcome.tool_calls.push_back(infernix::GeneratedToolCall{
