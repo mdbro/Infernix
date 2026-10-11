@@ -24,6 +24,7 @@ int main() {
     RuntimeStats baseline;
     baseline.generated_tokens         = 4;
     baseline.speculative_draft_tokens = 3;
+    baseline.expert_cache = ExpertCacheTotals{.frames = 100, .routed = 1000, .hits = 900, .promotions = 50, .landed = 5, .cpu_served = 60};
     Metrics metrics;
     metrics.configure("custom\"model\\name\nline", options, memory, baseline);
     RuntimeStats running = baseline;
@@ -32,12 +33,26 @@ int main() {
     running.speculative_accepted_tokens = 3;
     running.running_requests            = 1;
     running.prefix_selections           = 2;
+    running.expert_cache = ExpertCacheTotals{.frames = 120, .routed = 1480, .hits = 1332, .promotions = 80, .landed = 9, .cpu_served = 100};
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
     check(live.find("infernix_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
     check(live.find("infernix_spec_decode_draft_tokens_total 6\n") != std::string::npos,
           "speculative work must be observable before request completion");
+    check(live.find("infernix_expert_cache_frames 120\n") != std::string::npos &&
+              live.find("infernix_expert_cache_routed_total 480\n") != std::string::npos &&
+              live.find("infernix_expert_cache_hits_total 432\n") != std::string::npos &&
+              live.find("infernix_expert_cache_promotions_total 30\n") != std::string::npos &&
+              live.find("infernix_expert_cache_landed_total 4\n") != std::string::npos &&
+              live.find("infernix_expert_cache_cpu_served_total 40\n") != std::string::npos,
+          "expert-cache counters start after warmup and the frames gauge is absolute");
+    {
+        RuntimeStats dense = running;
+        dense.expert_cache.reset();
+        check(metrics.render(dense, true).find("infernix_expert_cache_") == std::string::npos,
+              "no expert-cache metrics without an expert cache");
+    }
     check(live.find("infernix_time_to_first_token_seconds_count 1\n") != std::string::npos &&
               live.find("infernix_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");

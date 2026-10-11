@@ -420,6 +420,9 @@ public:
     [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
     // How the expert frames were sized at construction.
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
+    // The expert cache's cumulative counters and current size (RuntimeStats::expert_cache); nothing
+    // without an expert cache. Engine thread, between rounds.
+    [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
 
     // Expert-cache resizing outside rounds (design §19.3.7). The VRAM monitor calls the waker from
     // its own thread when the cache should resize; the engine then calls maintain() from its

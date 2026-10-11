@@ -37,6 +37,8 @@ struct CompletionTimings {
     double predicted_per_second    = 0.0;
     std::uint64_t draft_n          = 0;
     std::uint64_t draft_n_accepted = 0;
+    std::uint64_t expert_routed_n  = 0; // Qwen3.8-Flash-Next: routed (layer, expert) uses
+    std::uint64_t expert_hit_n     = 0; // of those, served from the VRAM expert cache
 };
 
 double finite_nonnegative(double value) {
@@ -54,7 +56,8 @@ double tokens_per_second(std::uint32_t tokens, double milliseconds) {
 CompletionTimings make_completion_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
                                           std::uint32_t generated_tokens, double prompt_ms,
                                           double generation_ms, std::uint64_t draft_tokens = 0,
-                                          std::uint64_t accepted_draft_tokens = 0) {
+                                          std::uint64_t accepted_draft_tokens = 0,
+                                          std::uint64_t expert_routed = 0, std::uint64_t expert_hits = 0) {
     CompletionTimings timings;
     timings.cache_n             = std::min(cached_tokens, prompt_tokens);
     timings.prompt_n            = prompt_tokens - timings.cache_n;
@@ -69,6 +72,8 @@ CompletionTimings make_completion_timings(std::uint32_t prompt_tokens, std::uint
     timings.predicted_per_second   = tokens_per_second(decode_intervals, timings.predicted_ms);
     timings.draft_n                = draft_tokens;
     timings.draft_n_accepted       = accepted_draft_tokens;
+    timings.expert_routed_n        = expert_routed;
+    timings.expert_hit_n           = expert_hits;
     return timings;
 }
 
@@ -86,17 +91,22 @@ Json timings_json(const CompletionTimings& timings) {
         output["draft_n"]          = timings.draft_n;
         output["draft_n_accepted"] = timings.draft_n_accepted;
     }
+    if (timings.expert_routed_n != 0) {
+        output["expert_routed_n"] = timings.expert_routed_n;
+        output["expert_hit_n"]    = timings.expert_hit_n;
+    }
     return output;
 }
 
 CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
+    const infernix::ExpertCacheStats experts = outcome.metrics.expert_cache.value_or(infernix::ExpertCacheStats{});
     return make_completion_timings(
         static_cast<std::uint32_t>(std::max(0, outcome.prompt_tokens)),
         outcome.metrics.prefix_cache_hit_tokens,
         static_cast<std::uint32_t>(std::max(0, outcome.completion_tokens)),
         outcome.metrics.prompt_wall_seconds * 1000.0,
         outcome.metrics.generation_wall_seconds * 1000.0, outcome.metrics.speculative_draft_tokens,
-        outcome.metrics.speculative_accepted_tokens);
+        outcome.metrics.speculative_accepted_tokens, experts.routed, experts.hits);
 }
 
 CompletionTimings observation_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,

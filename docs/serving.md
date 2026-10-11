@@ -512,7 +512,10 @@ starts at that first token and ends at the last committed output token. Accordin
 speed uses `max(predicted_n - 1, 0)` token intervals; the first token belongs to prompt latency and
 is not counted again as a decode interval. Zero-token, one-token, zero-duration, and exact-cache-hit
 cases report finite zero rates rather than `NaN` or infinity. Speculative requests additionally
-include terminal `draft_n` and `draft_n_accepted` when draft work occurred.
+include terminal `draft_n` and `draft_n_accepted` when draft work occurred. Qwen3.8-Flash-Next
+responses additionally include `expert_routed_n`, the request's routed (layer, expert) uses, and
+`expert_hit_n`, how many of them its VRAM expert cache served. The cumulative per-token snapshots
+below carry neither the draft nor the expert fields.
 
 Set top-level `timings_per_token: true` on a streaming request to attach the latest cumulative
 timing snapshot to each visible reasoning or content chunk. This does not enable terminal timings,
@@ -1328,6 +1331,7 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
 | `infernix_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
+| `infernix_expert_cache_frames`, `infernix_expert_cache_{routed,hits,promotions,landed,cpu_served}_total` | Qwen3.8-Flash-Next's VRAM expert cache: frames backed now (one expert each), routed (layer, expert) uses, those served from a frame, experts copied into frames by the policy or adopted from staged misses, and misses computed by the CPU expert team; absent for other models |
 | `infernix_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes; a snapshot restore resumed from a cache snapshot at the paused frontier |
 | `infernix_{root,prefix}_selections_total` | Initial bindings from the root and from a prefix-cache snapshot |
 | `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; cached blocks and snapshots also occupy these pools |
